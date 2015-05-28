@@ -8,12 +8,16 @@ type
   IThreadBarrier = interface
     ['{06544DF9-4ED2-4708-845C-76AB4F46A373}']
 
+    function GetCurrentPhase: cardinal;
+
     /// <summary>
     ///  Blocks until the required number of threads have called Wait on this barrier.
     ///  One of the threads will return ThreadBarrierStatusSerial, indicating that it can
     ///  update shared resources. The remaining threads will return ThreadBarrierStatusOk.
     /// </summary>
     function Wait: ThreadBarrierStatus;
+
+    property CurrentPhase: cardinal read GetCurrentPhase;
   end;
 
 /// <summary>
@@ -27,49 +31,22 @@ function NewThreadBarrier(const ThreadCount: integer): IThreadBarrier;
 implementation
 
 uses
-  System.SysUtils, Winapi.Windows, System.SyncObjs;
-
-type
-  // simple wrapper
-  TLock = record
-  strict private
-    FCritSection: TRTLCriticalSection;
-    FPadding: array[0..(64 - SizeOf(TRTLCriticalSection))-1] of UInt8;
-  public
-    procedure Initialize;
-
-    procedure Aquire;
-    procedure Release;
-  end;
-
-{ TLock }
-
-procedure TLock.Aquire;
-begin
-  EnterCriticalSection(FCritSection);
-end;
-
-procedure TLock.Initialize;
-begin
-  InitializeCriticalSection(FCritSection);
-  FillChar(FPadding, SizeOf(FPadding), 0);
-end;
-
-procedure TLock.Release;
-begin
-  LeaveCriticalSection(FCritSection);
-end;
+  System.SysUtils, System.SyncObjs, Winapi.Windows;
 
 type
   TThreadBarrierImpl = class(TInterfacedObject, IThreadBarrier)
   strict private
-    FCurWaitThreadCount: integer;
+    FCurWaitThreadCount: array[0..1] of integer;
+    FBarrierOpen: array[0..1] of boolean;
+    FPhase: cardinal;
     FThreadCount: integer;
-    FBarrierEvents: TArray<THandle>;
-    FBarrierLocks: TArray<TLock>;
+    FBarrierCS: TCriticalSection;
+    FBarrierCV: array[0..1] of TConditionVariableCS;
   public
     constructor Create(const ThreadCount: integer);
     destructor Destroy; override;
+
+    function GetCurrentPhase: cardinal;
 
     function Wait: ThreadBarrierStatus;
   end;
@@ -82,99 +59,101 @@ end;
 { TBarrierImpl }
 
 constructor TThreadBarrierImpl.Create(const ThreadCount: integer);
-var
-  i: integer;
-  h: THandle;
 begin
   inherited Create;
 
   if (ThreadCount <= 0) then
     raise EArgumentException.Create('Invalid ThreadCount');
 
-  FCurWaitThreadCount := ThreadCount;
   FThreadCount := ThreadCount;
+  FCurWaitThreadCount[0] := ThreadCount;
+  FCurWaitThreadCount[1] := ThreadCount;
 
-  SetLength(FBarrierEvents, ThreadCount);
-  SetLength(FBarrierLocks, ThreadCount);
-  for i := 0 to ThreadCount-1 do
-  begin
-    h := CreateEvent(nil, True, False, nil);
-    if (h = 0) then
-      RaiseLastOSError;
+  FBarrierOpen[0] := False;
+  FBarrierOpen[1] := False;
 
-    FBarrierEvents[i] := h;
-
-    FBarrierLocks[i].Initialize;
-  end;
+  FBarrierCS := TCriticalSection.Create;
+  FBarrierCV[0] := TConditionVariableCS.Create;
+  FBarrierCV[1] := TConditionVariableCS.Create;
 end;
 
 destructor TThreadBarrierImpl.Destroy;
-var
-  i: integer;
 begin
-  for i := 0 to FThreadCount-1 do
-  begin
-    if (FBarrierEvents[i] <> 0) then
-      CloseHandle(FBarrierEvents[i]);
-  end;
+  FBarrierCV[0].Free;
+  FBarrierCV[1].Free;
+  FBarrierCS.Free;
 
   inherited;
 end;
 
+function TThreadBarrierImpl.GetCurrentPhase: cardinal;
+begin
+  result := FPhase;
+end;
+
 function TThreadBarrierImpl.Wait: ThreadBarrierStatus;
 var
+  phaseIndex: integer;
   curThreadIndex: integer;
-  i: integer;
-  wr: cardinal;
+  lastThreadThisPhase: boolean;
+  wr: TWaitResult;
 begin
-  curThreadIndex := TInterlocked.Decrement(FCurWaitThreadCount);
+  // by default we're just another thread
+  result := ThreadBarrierStatusOk;
 
-  // too many thread entered
-  if (curThreadIndex < 0) then
-    raise EInvalidOpException.Create('Barrier.Wait');
+  // we share critical section to ensure one thread can't
+  // get ahead of the others
+  FBarrierCS.Enter;
 
-  // enter the barrier lock for this index
-  // prevents "re-entry" of another thread before
-  // the ResetEvent call is made for this index
-  FBarrierLocks[curThreadIndex].Aquire();
-
-  if (curThreadIndex = 0) then
-  begin
-    result := ThreadBarrierStatusSerial;
-
-    // the last thread, all the others are waiting for us
-    // so current thread can set the wait thread counter
-    // but aquire the lock first
-    TInterlocked.Exchange(FCurWaitThreadCount, FThreadCount);
-  end
-  else
-  begin
-    result := ThreadBarrierStatusOk;
-  end;
-
-  // signal that this thread is ready
-  SetEvent(FBarrierEvents[curThreadIndex]);
-
+  // the current phase index, so we can ping-pong the counters and cv's
+  phaseIndex := FPhase and 1;
   try
-    // wait for barrier events
-    // can't use WaitForMultipleObjects because the ResetEvent
-    // will cause threads not woken up yeat from the wait
-    // to continue to wait
-    // by looping in the opposide direction of how we set the events
-    // we ensure that the event we reset has been
-    // successfully waited on by all other threads
-    for i := FThreadCount-1 downto 0 do
+    Dec(FCurWaitThreadCount[phaseIndex]);
+
+    curThreadIndex := FCurWaitThreadCount[phaseIndex];
+
+    // too many thread entered
+    if (curThreadIndex < 0) then
+      raise EInvalidOpException.Create('Barrier.Wait');
+
+    if (curThreadIndex = 0) then
     begin
-      wr := WaitForSingleObject(FBarrierEvents[i], INFINITE);
-
-      if (wr <> WAIT_OBJECT_0) then
-        RaiseLastOSError;
+      // final thread is the serializer
+      result := ThreadBarrierStatusSerial;
+      // this marks the release of the other threads
+      FBarrierOpen[phaseIndex] := True;
+      // and thus starts the next phase
+      FPhase := FPhase + 1;
+    end
+    else
+    begin
+      // wait for the barrier to open
+      repeat
+        wr := FBarrierCV[phaseIndex].WaitFor(FBarrierCS);
+        if (wr <> wrSignaled) then
+          raise ESyncObjectException.Create('CV error');
+      until (FBarrierOpen[phaseIndex]);
     end;
-  finally
-    ResetEvent(FBarrierEvents[curThreadIndex]);
 
-    // release any threads waiting to enter the barrier
-    FBarrierLocks[curThreadIndex].Release;
+  finally
+    // this resets the counter
+    // while allowing us to trigger the "last thread to leave" action
+    Inc(FCurWaitThreadCount[phaseIndex]);
+
+    // last thread resets open flag
+    lastThreadThisPhase := (FCurWaitThreadCount[phaseIndex] = FThreadCount);
+    if (lastThreadThisPhase) then
+    begin
+      FBarrierOpen[phaseIndex] := False;
+    end;
+
+    FBarrierCS.Release;
+
+    if (result = ThreadBarrierStatusSerial) then
+    begin
+      // we've opened the barrier, time to wake the other threads
+      FBarrierCV[phaseIndex].ReleaseAll;
+    end;
   end;
 end;
 

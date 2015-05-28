@@ -28,9 +28,22 @@ begin
       s: string;
     begin
       threadStatus := Barrier.Wait;
-      s := Name + ' released';
+      threadStatus := Barrier.Wait;
+
+      s := 'Pass #1 ' + Name;
       if (threadStatus = ThreadBarrierStatusSerial) then
-        s := s + ' ==> Serial thread';
+        s := s + ' ==> Serial (' + IntToStr(Barrier.CurrentPhase) + ')';
+      Print(s);
+
+      Sleep(200);
+
+      threadStatus := Barrier.Wait;
+      threadStatus := Barrier.Wait;
+
+      threadStatus := Barrier.Wait;
+      s := 'Pass #2 ' + Name;
+      if (threadStatus = ThreadBarrierStatusSerial) then
+        s := s + ' ==> Serial (' + IntToStr(Barrier.CurrentPhase) + ')';
       Print(s);
     end
 end;
@@ -39,20 +52,18 @@ procedure Test;
 var
   barrier: IThreadBarrier;
   mp: TProc;
+  i, n: integer;
 begin
-  barrier := NewThreadBarrier(4);
+  n := 50;
 
-  TThread.CreateAnonymousThread(
-    NewThreadProc(Barrier, 'Thread 1')
-  ).Start;
+  barrier := NewThreadBarrier(n);
 
-  TThread.CreateAnonymousThread(
-    NewThreadProc(Barrier, 'Thread 2')
-  ).Start;
-
-  TThread.CreateAnonymousThread(
-    NewThreadProc(Barrier, 'Thread 3')
-  ).Start;
+  for i := 1 to n-1 do
+  begin
+    TThread.CreateAnonymousThread(
+      NewThreadProc(Barrier, Format('Thread %d', [i]))
+    ).Start;
+  end;
 
   mp := NewThreadProc(Barrier, 'Main thread');
   mp();
