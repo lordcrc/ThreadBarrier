@@ -31,7 +31,7 @@ function NewThreadBarrier(const ThreadCount: integer): IThreadBarrier;
 implementation
 
 uses
-  System.SysUtils, System.SyncObjs, Winapi.Windows;
+  System.SysUtils, System.SyncObjs;
 
 type
   TThreadBarrierImpl = class(TInterfacedObject, IThreadBarrier)
